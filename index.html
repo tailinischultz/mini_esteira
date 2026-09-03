@@ -393,7 +393,8 @@ footer b{color:var(--ink-2)}
     chkAll.indeterminate = n>0 && n<chks.length;
     dlbtn.disabled = n===0 || !podeBaixar;
     dlbtn.textContent = n===0 ? "Baixar selecionados"
-      : (n===1 ? "Baixar 1 modelo" : "Baixar "+n+" modelos");
+      : (n===1 ? ("Baixar 1 modelo"+(modo==="web"?" (.stl)":" (.txt)"))
+               : ("Baixar "+n+" modelos"+(modo==="web"?" (.zip)":" (.txt)")));
   }
   chkAll.addEventListener("change",function(){
     chks.forEach(function(c){ c.checked=chkAll.checked; }); sync();
@@ -441,46 +442,119 @@ footer b{color:var(--ink-2)}
     return L.join("\n");
   }
 
-  var podeBaixar=false, downloads=null;
+  // ---------- dois caminhos de download ----------
+  // no claude.ai o sandbox bloqueia <a download> e nao aceita .stl: usa a capability e sai .txt
+  // em qualquer outro host (GitHub Pages, arquivo local) o download normal funciona e sai .stl
+  var podeBaixar=false, downloads=null, modo=null;
   dlbtn.disabled=true;
-  dlnote.innerHTML='Verificando se este navegador aceita salvar arquivos…';
-  if (window.claude && window.claude.use) {
-    window.claude.use("downloads").then(function(d){
-      downloads=d; podeBaixar=!!d;
-      dlnote.innerHTML = d
-        ? 'Sai como <b>.txt</b> porque a página publicada não pode entregar <b>.stl</b>. O conteúdo é STL em texto: renomeie a extensão para <b>.stl</b> e abre em qualquer fatiador.'
-        : 'Salvar arquivos não está disponível nesta visualização.';
-      sync();
-    }, function(){ dlnote.textContent='Download indisponível neste navegador.'; sync(); });
+
+  function modoWeb(){
+    modo="web"; podeBaixar=true;
+    dlnote.innerHTML='Baixa os arquivos <b>.stl</b> originais. Marcando mais de um, vem tudo num <b>.zip</b>.';
+    sync();
+  }
+  function modoClaude(d){
+    modo="claude"; downloads=d; podeBaixar=true;
+    dlnote.innerHTML='Aqui no claude.ai o arquivo sai como <b>.txt</b>, porque a página publicada não pode entregar <b>.stl</b>. O conteúdo é STL em texto: renomeie a extensão para <b>.stl</b>.';
+    sync();
+  }
+  if (window.claude && typeof window.claude.use === "function") {
+    dlnote.textContent='Verificando como este navegador permite salvar arquivos…';
+    window.claude.use("downloads").then(function(d){ d ? modoClaude(d) : modoWeb(); }, modoWeb);
   } else {
-    dlnote.textContent='Download só funciona na página publicada no claude.ai.';
+    modoWeb();
+  }
+
+  // ---------- zip sem compressao (metodo store) ----------
+  var CRC=(function(){var t=new Uint32Array(256),c;for(var n=0;n<256;n++){c=n;
+    for(var k=0;k<8;k++)c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);t[n]=c>>>0;}return t;})();
+  function crc32(u8){var c=0xFFFFFFFF;
+    for(var i=0;i<u8.length;i++)c=CRC[(c^u8[i])&0xFF]^(c>>>8);
+    return (c^0xFFFFFFFF)>>>0;}
+  function u16(v){return [v&255,(v>>8)&255];}
+  function u32(v){return [v&255,(v>>8)&255,(v>>16)&255,(v>>>24)&255];}
+  function zipStore(files){
+    var partes=[], central=[], off=0, enc=new TextEncoder();
+    files.forEach(function(f){
+      var nb=enc.encode(f.name), crc=crc32(f.data), sz=f.data.length;
+      var loc=[80,75,3,4].concat(u16(20),u16(0),u16(0),u16(0),u16(0),
+              u32(crc),u32(sz),u32(sz),u16(nb.length),u16(0));
+      partes.push(new Uint8Array(loc), nb, f.data);
+      central.push(new Uint8Array([80,75,1,2].concat(u16(20),u16(20),u16(0),u16(0),u16(0),u16(0),
+              u32(crc),u32(sz),u32(sz),u16(nb.length),u16(0),u16(0),u16(0),u16(0),u32(0),u32(off))), nb);
+      off += loc.length + nb.length + sz;
+    });
+    var cds=central.reduce(function(a,b){return a+b.length;},0);
+    var eocd=[80,75,5,6].concat(u16(0),u16(0),u16(files.length),u16(files.length),
+              u32(cds),u32(off),u16(0));
+    return new Blob(partes.concat(central,[new Uint8Array(eocd)]),{type:"application/zip"});
+  }
+  function salvaBlob(blob,nome){
+    var a=document.createElement("a"), url=URL.createObjectURL(blob);
+    a.href=url; a.download=nome; a.style.display="none";
+    document.body.appendChild(a); a.click();
+    setTimeout(function(){URL.revokeObjectURL(url); a.remove();},5000);
+  }
+  function bytes(b64){ return new Uint8Array(b64buf(b64)); }
+
+  // ---------- STL binario -> STL ASCII (so no caminho do claude.ai) ----------
+  function asciiSTL(b64, nome){
+    var buf=b64buf(b64), dv=new DataView(buf), n=dv.getUint32(80,true), o=84;
+    var L=["solid "+nome];
+    function f(){ var v=dv.getFloat32(o,true); o+=4; return v.toPrecision(7); }
+    for(var i=0;i<n;i++){
+      L.push("facet normal "+f()+" "+f()+" "+f());
+      L.push("  outer loop");
+      for(var v=0;v<3;v++) L.push("    vertex "+f()+" "+f()+" "+f());
+      L.push("  endloop"); L.push("endfacet");
+      o+=2;
+    }
+    L.push("endsolid "+nome);
+    return L.join("\n");
+  }
+
+  function marca(key,cls,txt){
+    var st=paneMod.querySelector('[data-st="'+key+'"]');
+    if(st){ st.className="st "+(cls||""); st.textContent=txt||""; }
   }
 
   dlbtn.addEventListener("click", function(){
-    if(!downloads) return;
     var alvos=[]; chks.forEach(function(c){ if(c.checked) alvos.push(c.getAttribute("data-key")); });
-    if(!alvos.length) return;
+    if(!alvos.length || !podeBaixar) return;
     dlbtn.disabled=true;
+
+    if (modo==="web") {
+      try{
+        if (alvos.length===1){
+          var f=STL[alvos[0]];
+          salvaBlob(new Blob([bytes(f.b64)],{type:"model/stl"}), f.nome);
+          marca(alvos[0],"ok","baixado");
+        } else {
+          salvaBlob(zipStore(alvos.map(function(k){
+            return {name:STL[k].nome, data:bytes(STL[k].b64)};
+          })), "modelos-mini-esteira.zip");
+          alvos.forEach(function(k){ marca(k,"ok","no zip"); });
+        }
+      }catch(e){ alvos.forEach(function(k){ marca(k,"no","falhou"); }); }
+      dlbtn.disabled=false; sync(); return;
+    }
+
     var i=0;
     function proximo(){
       if(i>=alvos.length){ dlbtn.disabled=false; sync(); return; }
       var key=alvos[i++], f=STL[key];
-      var st=paneMod.querySelector('[data-st="'+key+'"]');
-      st.className="st"; st.textContent="preparando…";
-      var txt=asciiSTL(f.b64, f.nome.replace(/\.stl$/,""));
-      downloads.save({filename:f.nome+".txt", data:txt}).then(function(){
-        st.className="st ok"; st.textContent="salvo";
-      }, function(err){
-        st.className="st no";
-        var c=err&&err.code;
-        st.textContent = c==="declined" ? "recusado"
-          : c==="too_large" ? "grande demais"
-          : c==="rate_limited" ? "aguarde e tente de novo"
-          : "não foi possível";
-      }).then(proximo, proximo);
+      marca(key,"","preparando…");
+      downloads.save({filename:f.nome+".txt", data:asciiSTL(f.b64, f.nome.replace(/\.stl$/,""))})
+        .then(function(){ marca(key,"ok","salvo"); },
+              function(err){
+                var c=err&&err.code;
+                marca(key,"no", c==="declined"?"recusado":c==="rate_limited"?"tente de novo":"não foi possível");
+              })
+        .then(proximo, proximo);
     }
     proximo();
   });
+
   sync(); aba(true);
 
 })();
